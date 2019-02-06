@@ -64,11 +64,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 
-/**
- * Filtro que agrega el X-Config-Token si los consumidores del config-server no lo envian
- *
- * @author pperez
- * @since 21-01-2019
+
  */
 @Component
 @Profile("vault")
@@ -176,11 +172,7 @@ import org.springframework.cloud.config.server.environment.VaultEnvironmentPrope
 import org.springframework.vault.support.VaultTokenResponse;
 import org.springframework.web.client.RestTemplate;
 
-/**
- * Utilitario para tratar con Vault
- *
- * @author pperez
- * @since 21-01-2019
+
  */
 @Slf4j
 public class VaultUtils {
