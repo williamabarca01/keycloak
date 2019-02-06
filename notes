@@ -1,0 +1,259 @@
+package org.springframework.cloud.vaultconfigserver.config;
+import org.apache.commons.lang.StringUtils;
+import org.apache.http.client.HttpClient;
+import org.springframework.cloud.config.server.environment.VaultEnvironmentProperties;
+import org.springframework.cloud.config.server.environment.VaultEnvironmentRepositoryFactory.VaultRestTemplateFactory;
+import org.springframework.cloud.config.server.support.HttpClientSupport;
+import org.springframework.context.annotation.Primary;
+import org.springframework.core.env.Environment;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestTemplate;
+
+@Component
+@Primary
+public class NamespaceScopedVaultRestTemplateFactory implements VaultRestTemplateFactory {
+
+    private final Environment environment;
+
+    public NamespaceScopedVaultRestTemplateFactory(Environment environment) {
+        this.environment = environment;
+    }
+
+    @Override
+    public RestTemplate build(VaultEnvironmentProperties environmentProperties) throws Exception {
+        HttpClient httpClient = HttpClientSupport.builder(environmentProperties).build();
+        RestTemplate restTemplate = new RestTemplate(new HttpComponentsClientHttpRequestFactory(httpClient));
+//            Obteniendo el Namespace por Ambiente, (PROD,DEV,UAT,QA)
+        String namespace = environment.getProperty("spring.cloud.config.server.vault.namespace");
+
+        // Si configuramos un NS, lo agregamos a los requests que mande a vault
+        if (StringUtils.isNotEmpty(namespace)) {
+            restTemplate.getInterceptors().add(((request, body, execution) -> {
+                request.getHeaders().add("X-Vault-Namespace", namespace);
+                return execution.execute(request, body);
+            }));
+        }
+        return restTemplate;
+    }
+
+
+}
+\\\\
+package org.springframework.cloud.vaultconfigserver.config;
+
+import java.io.IOException;
+import java.util.Arrays;
+import javax.servlet.*;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletRequestWrapper;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang.StringUtils;
+import org.apache.http.client.HttpClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cloud.config.server.environment.VaultEnvironmentProperties;
+import org.springframework.cloud.config.server.support.HttpClientSupport;
+import org.springframework.cloud.vaultconfigserver.util.VaultUtils;
+import org.springframework.context.annotation.Profile;
+import org.springframework.core.annotation.Order;
+import org.springframework.core.env.Environment;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
+import org.springframework.web.client.RestTemplate;
+
+/**
+ * Filtro que agrega el X-Config-Token si los consumidores del config-server no lo envian
+ *
+ * @author pperez
+ * @since 21-01-2019
+ */
+@Component
+@Profile("vault")
+@Order(1)
+@Slf4j
+public class XConfigTokenFilter implements Filter {
+    Logger LOG = LoggerFactory.getLogger(XConfigTokenFilter.class);
+    private static final String HEADER = "X-Config-Token";
+    private final Environment environment;
+    private final RestTemplate restTemplate;
+    private final VaultEnvironmentProperties props;
+
+    @Autowired
+    public XConfigTokenFilter(Environment environment, VaultEnvironmentProperties props) throws Exception {
+        this.environment = environment;
+        this.props = props;
+
+        HttpClient httpClient = HttpClientSupport.builder(props).build();
+        restTemplate = new RestTemplate(new HttpComponentsClientHttpRequestFactory(httpClient));
+    }
+
+    @Override
+    public void init(FilterConfig filterConfig) throws ServletException {
+
+    }
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+        HttpServletRequest httpServletRequest = (HttpServletRequest) request;
+
+        // Reviso si viene a actuator
+        String servletContextPath = environment.getProperty("server.servlet.context-path");
+        String actuatorBasePath = environment.getProperty("management.endpoints.web.base-path");
+        String actuatorPath = StringUtils.join(Arrays.asList(servletContextPath, actuatorBasePath), "");
+
+        // Si viene a actuator no le intentamos generar token al cliente
+    //    if (!StringUtils.startsWith(httpServletRequest.getRequestURI(), actuatorPath)) { VERIFICAR INTEGRACION CONFIG CAM
+        // Obtenemos el valor del header del config token
+        String header = httpServletRequest.getHeader(HEADER);
+
+        // Si el cliente no mando el token, le generamos uno aqui
+        if (StringUtils.isEmpty(header)) {
+//                log.debug("El cliente no envio token, generando uno en Vault");
+            LOG.trace("El cliente no envio token, generando uno en Vault");
+            String credentials = environment.getRequiredProperty("app.vault.serviceAccountCredentials");
+            String credentialsDelimiter = environment.getRequiredProperty("app.vault.serviceAccountCredentialsDelimiter");
+
+            String token;
+            try {
+                token = VaultUtils.getToken(props, restTemplate, credentials, credentialsDelimiter);
+            } catch (ResourceAccessException e) {
+                LOG.error("Error al generar token desde Vault", e);
+                throw e;
+            }
+            request = new ReplaceXConfigTokenRequest(httpServletRequest, token);
+        } else {
+            // Si el cliente mando su propio token lo delegamos directo a Vault
+            LOG.info("El cliente envio este token [{}], se forwardea a Vault as-is", header);
+//                log.trace("El cliente envio este token [{}], se forwardea a Vault as-is", header);
+        }
+  //  }
+
+        chain.doFilter(request, response);
+    }
+
+    @Override
+    public void destroy() {
+
+    }
+
+    private static class ReplaceXConfigTokenRequest extends HttpServletRequestWrapper {
+
+        private final String token;
+
+        ReplaceXConfigTokenRequest(HttpServletRequest request, String token) {
+            super(request);
+            this.token = token;
+        }
+
+        @Override
+        public String getHeader(String name) {
+            if (StringUtils.equals(name, HEADER)) {
+                // Esta pidiendo el token para vault, le entregamos el generado por el artefacto
+                return token;
+            }
+            return super.getHeader(name);
+        }
+    }
+}
+
+////
+
+
+package org.springframework.cloud.vaultconfigserver.util;
+
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.cloud.config.server.environment.VaultEnvironmentProperties;
+import org.springframework.vault.support.VaultTokenResponse;
+import org.springframework.web.client.RestTemplate;
+
+/**
+ * Utilitario para tratar con Vault
+ *
+ * @author pperez
+ * @since 21-01-2019
+ */
+@Slf4j
+public class VaultUtils {
+
+    /**
+     * Hace el login contra Vault y retorna el token
+     *
+     * @param props Configuracion de vault
+     * @param template Rest template para ir a Vault
+     * @param ldapCredentials Credenciales para acceder a Vault, separadas por credentialsDelimiter
+     * @param credentialsDelimiter Delimitador de las credenciales LDAP
+     */
+    public static String getToken(VaultEnvironmentProperties props, RestTemplate template, String ldapCredentials,
+                                  String credentialsDelimiter) {
+        // Obtenemos las credenciales separadas
+        Logger LOG = LoggerFactory.getLogger(VaultUtils.class);
+        String[] splittedCredentials = StringUtils.split(ldapCredentials, credentialsDelimiter, 2);
+        if (splittedCredentials.length < 2) {
+            throw new IllegalArgumentException(
+                    "Error al parsear credencial, debe llevar un delimitador");
+        }
+        String username = splittedCredentials[0];
+        String password = splittedCredentials[1];
+
+        LOG.info("Generando token con username [{}]", username);
+        LOG.info("Generando token usando password [{}]", password);
+
+        String baseUrl = String.format("%s://%s:%s", props.getScheme(), props.getHost(), props.getPort());
+
+        String authUrl = String.format("%s/v1/auth/ldap/login/{username}", baseUrl);
+
+
+        Map<String, Object> body = new ConcurrentHashMap<>();
+        body.put("password", password);
+
+        VaultTokenResponse response = template.postForObject(authUrl, body, VaultTokenResponse.class, username);
+
+        String token = response.getToken().getToken();
+        LOG.trace("Obtenido token [{}] con username [{}] y password [{}]", token, username, password);
+        LOG.info("Se obtuvo token via LDAP con username [{}]", token);
+
+        return token;
+    }
+
+}
+///
+server:
+  port: 8888
+
+spring:
+  profiles:
+    active: vault
+
+  cloud:
+    config:
+      server:
+        vault:
+          kvVersion: 2
+          host: 
+          backend: configclient #Nombre del Backend en HAV, la aplicacion enviara el nombre del secreto.
+          scheme: https
+          port: 443
+          skip-ssl-validation: true #Se ha deshabilitado mientras se tiene la solucion de TLS-Docker
+
+
+app.vault:
+  serviceAccountCredentials: ${SERVICE_ACCOUNT_CREDENTIALS}
+  serviceAccountCredentialsDelimiter: ${SERVICE_ACCOUNT_DELIMITER:|}
+///
+spring:
+  application:
+    name: property   #Nombre del secreto
+app:
+    serviceProperty : "
+
+
